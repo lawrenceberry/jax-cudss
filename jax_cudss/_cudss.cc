@@ -38,6 +38,9 @@ struct CacheKey {
   int32_t device_ordinal;
   int32_t reordering_alg;
   int32_t nd_nlevels;
+  int32_t host_nthreads;
+  bool mt_enabled;
+  std::string threading_lib;
   int64_t n;
   int64_t nnz;
   int64_t batch;
@@ -47,7 +50,10 @@ struct CacheKey {
   bool operator==(const CacheKey& other) const {
     return device_ordinal == other.device_ordinal &&
            reordering_alg == other.reordering_alg &&
-           nd_nlevels == other.nd_nlevels && n == other.n &&
+           nd_nlevels == other.nd_nlevels &&
+           host_nthreads == other.host_nthreads &&
+           mt_enabled == other.mt_enabled &&
+           threading_lib == other.threading_lib && n == other.n &&
            nnz == other.nnz && batch == other.batch && indptr == other.indptr &&
            indices == other.indices;
   }
@@ -62,6 +68,9 @@ struct CacheKeyHash {
     combine(std::hash<int32_t>{}(key.device_ordinal));
     combine(std::hash<int32_t>{}(key.reordering_alg));
     combine(std::hash<int32_t>{}(key.nd_nlevels));
+    combine(std::hash<int32_t>{}(key.host_nthreads));
+    combine(std::hash<bool>{}(key.mt_enabled));
+    combine(std::hash<std::string>{}(key.threading_lib));
     combine(std::hash<int64_t>{}(key.n));
     combine(std::hash<int64_t>{}(key.nnz));
     combine(std::hash<int64_t>{}(key.batch));
@@ -96,6 +105,8 @@ struct ProfileData {
   int32_t device_ordinal;
   int32_t reordering_alg;
   int32_t nd_nlevels;
+  int32_t host_nthreads;
+  bool mt_enabled;
   int64_t n;
   int64_t nnz;
   int64_t batch;
@@ -212,13 +223,47 @@ int32_t NdNLevelsFromEnv() {
   return static_cast<int32_t>(parsed);
 }
 
+bool MtEnabledFromEnv() {
+  const char* value = std::getenv("JAX_CUDSS_ENABLE_MT");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+int32_t HostNThreadsFromEnv() {
+  const char* value = std::getenv("JAX_CUDSS_HOST_NTHREADS");
+  if (value == nullptr || value[0] == '\0') {
+    return -1;
+  }
+
+  char* end = nullptr;
+  long parsed = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed <= 0 ||
+      parsed > static_cast<long>(std::numeric_limits<int32_t>::max())) {
+    return -1;
+  }
+  return static_cast<int32_t>(parsed);
+}
+
+std::string ThreadingLibFromEnv() {
+  const char* value = std::getenv("JAX_CUDSS_THREADING_LIB");
+  if (value != nullptr && value[0] != '\0') {
+    return std::string(value);
+  }
+  value = std::getenv("CUDSS_THREADING_LIB");
+  if (value != nullptr && value[0] != '\0') {
+    return std::string(value);
+  }
+  return std::string();
+}
+
 ffi::ErrorOr<std::shared_ptr<CachedResources>> GetOrCreateResources(
     int32_t device_ordinal, int32_t reordering_alg, int32_t nd_nlevels,
+    bool mt_enabled, int32_t host_nthreads, const std::string& threading_lib,
     cudaStream_t stream, int64_t n, int64_t nnz, int64_t batch,
     void* row_start, void* col_indices, void* a_values, void* b_values,
     void* x_values, bool* cache_hit) {
-  CacheKey key{device_ordinal, reordering_alg, nd_nlevels, n, nnz, batch,
-               row_start, col_indices};
+  CacheKey key{device_ordinal, reordering_alg, nd_nlevels, host_nthreads,
+               mt_enabled, threading_lib, n, nnz, batch, row_start,
+               col_indices};
 
   {
     std::lock_guard<std::mutex> lock(CacheMutex());
@@ -233,6 +278,14 @@ ffi::ErrorOr<std::shared_ptr<CachedResources>> GetOrCreateResources(
   cudssStatus_t status = cudssCreate(&resources->handle);
   if (status != CUDSS_STATUS_SUCCESS) {
     return ffi::Unexpected(CudssError("cudssCreate", status));
+  }
+  if (mt_enabled) {
+    const char* threading_lib_path =
+        threading_lib.empty() ? nullptr : threading_lib.c_str();
+    status = cudssSetThreadingLayer(resources->handle, threading_lib_path);
+    if (status != CUDSS_STATUS_SUCCESS) {
+      return ffi::Unexpected(CudssError("cudssSetThreadingLayer", status));
+    }
   }
   status = cudssSetStream(resources->handle, stream);
   if (status != CUDSS_STATUS_SUCCESS) {
@@ -260,6 +313,17 @@ ffi::ErrorOr<std::shared_ptr<CachedResources>> GetOrCreateResources(
     if (status != CUDSS_STATUS_SUCCESS) {
       return ffi::Unexpected(
           CudssError("cudssConfigSet(CUDSS_CONFIG_ND_NLEVELS)", status));
+    }
+  }
+
+  if (host_nthreads > 0) {
+    int host_nthreads_value = static_cast<int>(host_nthreads);
+    status = cudssConfigSet(resources->config, CUDSS_CONFIG_HOST_NTHREADS,
+                            &host_nthreads_value,
+                            sizeof(host_nthreads_value));
+    if (status != CUDSS_STATUS_SUCCESS) {
+      return ffi::Unexpected(
+          CudssError("cudssConfigSet(CUDSS_CONFIG_HOST_NTHREADS)", status));
     }
   }
 
@@ -342,9 +406,13 @@ ffi::Error JaxCudssUniformBatchSolveImpl(
   bool cache_hit = false;
   const int32_t reordering_alg = ReorderingAlgFromEnv();
   const int32_t nd_nlevels = NdNLevelsFromEnv();
+  const bool mt_enabled = MtEnabledFromEnv();
+  const int32_t host_nthreads = HostNThreadsFromEnv();
+  const std::string threading_lib = ThreadingLibFromEnv();
   auto maybe_resources = GetOrCreateResources(
-      device_ordinal, reordering_alg, nd_nlevels, stream, n, nnz, batch,
-      row_start, col_indices, a_values, b_values, x_values, &cache_hit);
+      device_ordinal, reordering_alg, nd_nlevels, mt_enabled, host_nthreads,
+      threading_lib, stream, n, nnz, batch, row_start, col_indices, a_values,
+      b_values, x_values, &cache_hit);
   if (!maybe_resources.has_value()) {
     return maybe_resources.error();
   }
@@ -425,6 +493,8 @@ ffi::Error JaxCudssUniformBatchSolveImpl(
         device_ordinal,
         reordering_alg,
         nd_nlevels,
+        host_nthreads,
+        mt_enabled,
         n,
         nnz,
         batch,
@@ -507,6 +577,8 @@ PyObject* LastProfile(PyObject*, PyObject*) {
       !add_int("device_ordinal", profile.device_ordinal) ||
       !add_int("reordering_alg", profile.reordering_alg) ||
       !add_int("nd_nlevels", profile.nd_nlevels) ||
+      !add_int("host_nthreads", profile.host_nthreads) ||
+      !add_bool("mt_enabled", profile.mt_enabled) ||
       !add_int("n", profile.n) ||
       !add_int("nnz", profile.nnz) ||
       !add_int("batch", profile.batch) ||
