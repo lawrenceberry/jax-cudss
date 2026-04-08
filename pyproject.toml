@@ -1,7 +1,15 @@
+[build-system]
+requires = [
+    "setuptools>=69",
+    "wheel",
+    "jax>=0.9.2",
+]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "jax-cudss"
 version = "0.1.0"
-description = "Add your description here"
+description = "Simple JAX FFI bindings for cuDSS sparse solves"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -19,3 +27,9 @@ dev = [
     "pytest>=9.0.3",
     "pytest-benchmark>=5.2.3",
 ]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["jax_cudss*"]
