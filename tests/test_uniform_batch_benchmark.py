@@ -28,6 +28,8 @@ SPARSE_FAVORABLE = Scenario(
     "larger_tridiagonal_sparse_favorable", 100, 256, (-1, 0, 1)
 )
 SCALING_BATCHES = (1, 10, 100, 1_000)
+TIMING_DIMENSIONS = (10, 100, 1_000)
+TIMING_BATCHES = (10, 100, 1_000)
 RESIDUAL_RTOL = 5e-4
 
 
@@ -75,6 +77,7 @@ def _problem_from_pattern(
     row_np: np.ndarray,
     col_np: np.ndarray,
     diag_np: np.ndarray,
+    include_dense: bool = True,
 ) -> dict[str, jax.Array]:
     rng = np.random.default_rng(0)
     nnz = row_np.shape[0]
@@ -91,23 +94,25 @@ def _problem_from_pattern(
             0.1, 0.5, size=(batch_size,)
         ).astype(np.float32)
 
-    dense = np.zeros((batch_size, matrix_size, matrix_size), dtype=np.float32)
-    dense[:, row_np, col_np] = values
-
     indptr = jnp.asarray(indptr_np)
+    row_indices = jnp.asarray(row_np)
     indices = jnp.asarray(col_np)
     values_jax = jnp.asarray(values)
     rhs_single = jnp.asarray(rhs)
     rhs_batch = jnp.broadcast_to(rhs_single, (batch_size, matrix_size))
-    dense_batch = jnp.asarray(dense)
-    return {
+    problem = {
         "indptr": indptr,
+        "row_indices": row_indices,
         "indices": indices,
         "values": values_jax,
         "rhs_single": rhs_single,
         "rhs_batch": rhs_batch,
-        "dense_batch": dense_batch,
     }
+    if include_dense:
+        dense = np.zeros((batch_size, matrix_size, matrix_size), dtype=np.float32)
+        dense[:, row_np, col_np] = values
+        problem["dense_batch"] = jnp.asarray(dense)
+    return problem
 
 
 @lru_cache(maxsize=None)
@@ -122,6 +127,22 @@ def benchmark_problem(scenario: Scenario) -> dict[str, jax.Array]:
         row_np=row_np,
         col_np=col_np,
         diag_np=diag_np,
+        include_dense=True,
+    )
+
+
+def sparse_problem(
+    batch_size: int, matrix_size: int, offsets: tuple[int, ...]
+) -> dict[str, jax.Array]:
+    indptr_np, row_np, col_np, diag_np = _pattern(matrix_size, offsets)
+    return _problem_from_pattern(
+        batch_size=batch_size,
+        matrix_size=matrix_size,
+        indptr_np=indptr_np,
+        row_np=row_np,
+        col_np=col_np,
+        diag_np=diag_np,
+        include_dense=False,
     )
 
 
@@ -170,6 +191,17 @@ def _assert_small_residual(
     dense_batch: jax.Array, rhs_batch: jax.Array, x: jax.Array
 ) -> None:
     residual = jnp.einsum("bij,bj->bi", dense_batch, x) - rhs_batch
+    max_residual = float(jnp.max(jnp.linalg.norm(residual, axis=1)))
+    assert max_residual < RESIDUAL_RTOL, f"max residual too large: {max_residual}"
+
+
+def _assert_small_sparse_residual(problem: dict[str, jax.Array], x: jax.Array) -> None:
+    rows = problem["row_indices"]
+    cols = problem["indices"]
+    values = problem["values"]
+    rhs_batch = problem["rhs_batch"]
+    ax = jnp.zeros_like(rhs_batch).at[:, rows].add(values * x[:, cols])
+    residual = ax - rhs_batch
     max_residual = float(jnp.max(jnp.linalg.norm(residual, axis=1)))
     assert max_residual < RESIDUAL_RTOL, f"max residual too large: {max_residual}"
 
@@ -272,6 +304,65 @@ def test_cudss_rebuilds_when_sparsity_changes() -> None:
 
     assert handle_left.structure_hash != handle_right.structure_hash
     assert handle_left.token != handle_right.token
+
+
+@pytest.mark.parametrize("matrix_size", TIMING_DIMENSIONS)
+def test_cudss_analysis_timing_by_dimension(
+    monkeypatch: pytest.MonkeyPatch, matrix_size: int
+) -> None:
+    _require_gpu()
+    _require_cudss()
+    monkeypatch.setenv("JAX_CUDSS_PROFILE", "1")
+    monkeypatch.setenv("JAX_CUDSS_MAX_PREPARED_SOLVERS", "1")
+
+    problem = sparse_problem(100, matrix_size, (-1, 0, 1))
+    jax_cudss.clear_cudss_last_profile()
+    handle = jax_cudss.setup_solver_csr(
+        problem["indptr"], problem["indices"], batch_size=100
+    )
+    profile = jax_cudss.cudss_last_profile()
+    assert profile is not None
+    assert profile["analysis_ms"] >= 0.0
+    print(
+        f"\ncuDSS analysis timing (ms): batch=100, n={matrix_size}, "
+        f"analysis={float(profile['analysis_ms']):.3f}"
+    )
+
+    del handle
+    gc.collect()
+
+
+@pytest.mark.parametrize("matrix_size", TIMING_DIMENSIONS)
+@pytest.mark.parametrize("batch_size", TIMING_BATCHES)
+def test_cudss_prepared_solve_timing_grid(
+    monkeypatch: pytest.MonkeyPatch, matrix_size: int, batch_size: int
+) -> None:
+    _require_gpu()
+    _require_cudss()
+    monkeypatch.setenv("JAX_CUDSS_MAX_PREPARED_SOLVERS", "1")
+    if matrix_size == 1_000 and batch_size == 1_000:
+        pytest.skip(
+            "Prepared cuDSS solve timing for n=1000, batch=1000 exceeds the "
+            "memory budget on this GPU."
+        )
+
+    problem = sparse_problem(batch_size, matrix_size, (-1, 0, 1))
+    handle = jax_cudss.setup_solver_csr(
+        problem["indptr"], problem["indices"], batch_size=batch_size
+    )
+    solve = jax.jit(lambda values, rhs: jax_cudss.solve_graph_csr(handle, values, rhs))
+    result = jax.block_until_ready(solve(problem["values"], problem["rhs_single"]))
+    _assert_small_sparse_residual(problem, result)
+    timing_ms = _time_call(solve, problem["values"], problem["rhs_single"]) * 1e3
+    print(
+        f"\ncuDSS prepared solve timing (ms): n={matrix_size}, "
+        f"batch={batch_size}, factorize_and_solve={timing_ms:.3f}"
+    )
+
+    del result
+    del solve
+    del handle
+    gc.collect()
 
 
 def test_cudss_scaling_smoke() -> None:
