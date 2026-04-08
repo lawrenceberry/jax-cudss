@@ -49,12 +49,19 @@ def _discover_cudss() -> tuple[list[str], list[str]]:
             lib_dirs.append(str(lib))
 
     cuda_runtime_include = os.environ.get("CUDA_RUNTIME_INCLUDE_DIR")
+    cuda_runtime_lib = os.environ.get("CUDA_RUNTIME_LIBRARY_DIR")
     if cuda_runtime_include:
         include_dirs.append(cuda_runtime_include)
     else:
         include = _dist_path("nvidia-cuda-runtime-cu12", "nvidia/cuda_runtime/include")
         if include:
             include_dirs.append(str(include))
+    if cuda_runtime_lib:
+        lib_dirs.append(cuda_runtime_lib)
+    else:
+        lib = _dist_path("nvidia-cuda-runtime-cu12", "nvidia/cuda_runtime/lib")
+        if lib:
+            lib_dirs.append(str(lib))
 
     return _dedupe(include_dirs), _dedupe(lib_dirs)
 
@@ -62,6 +69,15 @@ def _discover_cudss() -> tuple[list[str], list[str]]:
 def _discover_cudss_shared_object(lib_dirs: list[str]) -> str | None:
     for lib_dir in lib_dirs:
         for candidate in ("libcudss.so", "libcudss.so.0"):
+            path = Path(lib_dir) / candidate
+            if path.exists():
+                return str(path)
+    return None
+
+
+def _discover_cuda_runtime_shared_object(lib_dirs: list[str]) -> str | None:
+    for lib_dir in lib_dirs:
+        for candidate in ("libcudart.so", "libcudart.so.12"):
             path = Path(lib_dir) / candidate
             if path.exists():
                 return str(path)
@@ -81,17 +97,20 @@ class OptionalBuildExt(build_ext):
     def build_extension(self, ext: Extension) -> None:
         include_dirs, lib_dirs = _discover_cudss()
         cudss_shared_object = _discover_cudss_shared_object(lib_dirs)
+        cudart_shared_object = _discover_cuda_runtime_shared_object(lib_dirs)
         jax_include = _discover_jax_include()
         if (
             not include_dirs
             or not lib_dirs
             or cudss_shared_object is None
+            or cudart_shared_object is None
             or jax_include is None
         ):
             warnings.warn(
                 "Skipping cuDSS extension build because JAX or cuDSS headers/libraries "
                 "were not found. Install the optional CUDA dependencies or set "
-                "CUDSS_ROOT/CUDSS_INCLUDE_DIR/CUDSS_LIBRARY_DIR.",
+                "CUDSS_ROOT/CUDSS_INCLUDE_DIR/CUDSS_LIBRARY_DIR and "
+                "CUDA_RUNTIME_LIBRARY_DIR as needed.",
                 stacklevel=2,
             )
             return
@@ -99,7 +118,7 @@ class OptionalBuildExt(build_ext):
         ext.include_dirs = _dedupe([*ext.include_dirs, *include_dirs, jax_include])
         ext.library_dirs = _dedupe([*ext.library_dirs, *lib_dirs])
         ext.libraries = []
-        ext.extra_objects = [cudss_shared_object]
+        ext.extra_objects = [cudss_shared_object, cudart_shared_object]
         if os.name != "nt":
             ext.runtime_library_dirs = _dedupe(
                 [*(ext.runtime_library_dirs or []), *lib_dirs]
