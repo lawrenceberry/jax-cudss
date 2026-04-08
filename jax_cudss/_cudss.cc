@@ -163,6 +163,8 @@ struct PreparedSolver {
   void* device_indptr = nullptr;
   void* device_indices = nullptr;
   cudaEvent_t last_use_event = nullptr;
+  bool has_factorization = false;
+  int64_t factorization_generation = 0;
 };
 
 std::mutex& RegistryMutex() {
@@ -642,6 +644,7 @@ ffi::Error JaxCudssSetupSolverImpl(int32_t device_ordinal, cudaStream_t stream,
       std::shared_ptr<PreparedSolver> prepared = token_it->second;
       prepared->owners += 1;
       prepared->last_use_seq = UseSequence()++;
+      prepared->has_factorization = false;
       DebugLog("setup cache hit");
       ffi::Error write_status = WriteTokenResult(out, prepared->token, stream);
       if (!write_status.success()) {
@@ -742,9 +745,8 @@ ffi::Error JaxCudssSetupSolverImpl(int32_t device_ordinal, cudaStream_t stream,
   return ffi::Error::Success();
 }
 
-ffi::Error JaxCudssSolveGraphImpl(int32_t, cudaStream_t stream,
-                                  F32BufferR2 values, F32BufferR2 rhs,
-                                  int64_t token, F32ResultR2 out) {
+ffi::Error JaxCudssFactorizeGraphImpl(int32_t, cudaStream_t stream,
+                                      F32BufferR2 values, int64_t token) {
   auto maybe_prepared = LookupPreparedSolver(token, /*update_lru=*/true);
   if (!maybe_prepared.has_value()) {
     return maybe_prepared.error();
@@ -752,25 +754,11 @@ ffi::Error JaxCudssSolveGraphImpl(int32_t, cudaStream_t stream,
   std::shared_ptr<PreparedSolver> prepared = *maybe_prepared;
 
   const auto value_dims = values.dimensions();
-  const auto rhs_dims = rhs.dimensions();
-  const auto out_dims = out->dimensions();
   if (value_dims[0] != prepared->key.batch ||
       value_dims[1] != prepared->key.nnz) {
     std::ostringstream stream_dims;
     stream_dims << "values must have shape [" << prepared->key.batch << ", "
                 << prepared->key.nnz << "]";
-    return {ffi::ErrorCode::kInvalidArgument, stream_dims.str()};
-  }
-  if (rhs_dims[0] != prepared->key.batch || rhs_dims[1] != prepared->key.n) {
-    std::ostringstream stream_dims;
-    stream_dims << "rhs must have shape [" << prepared->key.batch << ", "
-                << prepared->key.n << "]";
-    return {ffi::ErrorCode::kInvalidArgument, stream_dims.str()};
-  }
-  if (out_dims[0] != prepared->key.batch || out_dims[1] != prepared->key.n) {
-    std::ostringstream stream_dims;
-    stream_dims << "output must have shape [" << prepared->key.batch << ", "
-                << prepared->key.n << "]";
     return {ffi::ErrorCode::kInvalidArgument, stream_dims.str()};
   }
 
@@ -779,20 +767,11 @@ ffi::Error JaxCudssSolveGraphImpl(int32_t, cudaStream_t stream,
   if (status != CUDSS_STATUS_SUCCESS) {
     return CudssError("cudssSetStream", status);
   }
+  prepared->has_factorization = false;
   status = cudssMatrixSetValues(prepared->a_matrix,
                                 static_cast<void*>(values.typed_data()));
   if (status != CUDSS_STATUS_SUCCESS) {
     return CudssError("cudssMatrixSetValues(A)", status);
-  }
-  status = cudssMatrixSetValues(prepared->b_matrix,
-                                static_cast<void*>(rhs.typed_data()));
-  if (status != CUDSS_STATUS_SUCCESS) {
-    return CudssError("cudssMatrixSetValues(rhs)", status);
-  }
-  status =
-      cudssMatrixSetValues(prepared->x_matrix, static_cast<void*>(out->typed_data()));
-  if (status != CUDSS_STATUS_SUCCESS) {
-    return CudssError("cudssMatrixSetValues(solution)", status);
   }
 
   status = cudssExecute(prepared->handle, CUDSS_PHASE_FACTORIZATION,
@@ -813,6 +792,61 @@ ffi::Error JaxCudssSolveGraphImpl(int32_t, cudaStream_t stream,
     std::ostringstream stream_info;
     stream_info << "cuDSS factorization reported non-zero info=" << info;
     return {ffi::ErrorCode::kInternal, stream_info.str()};
+  }
+
+  prepared->has_factorization = true;
+  prepared->factorization_generation += 1;
+
+  ffi::Error event_status = EnsureRecordedEvent(*prepared, stream);
+  if (!event_status.success()) {
+    return event_status;
+  }
+
+  return ffi::Error::Success();
+}
+
+ffi::Error JaxCudssSolveGraphImpl(int32_t, cudaStream_t stream, F32BufferR2 rhs,
+                                  int64_t token, F32ResultR2 out) {
+  auto maybe_prepared = LookupPreparedSolver(token, /*update_lru=*/true);
+  if (!maybe_prepared.has_value()) {
+    return maybe_prepared.error();
+  }
+  std::shared_ptr<PreparedSolver> prepared = *maybe_prepared;
+
+  const auto rhs_dims = rhs.dimensions();
+  const auto out_dims = out->dimensions();
+  if (rhs_dims[0] != prepared->key.batch || rhs_dims[1] != prepared->key.n) {
+    std::ostringstream stream_dims;
+    stream_dims << "rhs must have shape [" << prepared->key.batch << ", "
+                << prepared->key.n << "]";
+    return {ffi::ErrorCode::kInvalidArgument, stream_dims.str()};
+  }
+  if (out_dims[0] != prepared->key.batch || out_dims[1] != prepared->key.n) {
+    std::ostringstream stream_dims;
+    stream_dims << "output must have shape [" << prepared->key.batch << ", "
+                << prepared->key.n << "]";
+    return {ffi::ErrorCode::kInvalidArgument, stream_dims.str()};
+  }
+
+  std::lock_guard<std::mutex> handle_lock(prepared->mu);
+  if (!prepared->has_factorization) {
+    return {ffi::ErrorCode::kInvalidArgument,
+            "no factorization is available; call factorize_graph_csr first"};
+  }
+
+  cudssStatus_t status = cudssSetStream(prepared->handle, stream);
+  if (status != CUDSS_STATUS_SUCCESS) {
+    return CudssError("cudssSetStream", status);
+  }
+  status = cudssMatrixSetValues(prepared->b_matrix,
+                                static_cast<void*>(rhs.typed_data()));
+  if (status != CUDSS_STATUS_SUCCESS) {
+    return CudssError("cudssMatrixSetValues(rhs)", status);
+  }
+  status =
+      cudssMatrixSetValues(prepared->x_matrix, static_cast<void*>(out->typed_data()));
+  if (status != CUDSS_STATUS_SUCCESS) {
+    return CudssError("cudssMatrixSetValues(solution)", status);
   }
 
   status = cudssExecute(prepared->handle, CUDSS_PHASE_SOLVE, prepared->config,
@@ -841,11 +875,18 @@ auto SetupSolverBinding() {
       .Ret<ffi::Buffer<ffi::S64, 0>>();
 }
 
-auto SolveGraphBinding() {
+auto FactorizeGraphBinding() {
   return ffi::Ffi::Bind()
       .Ctx<ffi::DeviceOrdinal>()
       .Ctx<ffi::PlatformStream<cudaStream_t>>()
       .Arg<F32BufferR2>()
+      .Attr<int64_t>("token");
+}
+
+auto SolveGraphBinding() {
+  return ffi::Ffi::Bind()
+      .Ctx<ffi::DeviceOrdinal>()
+      .Ctx<ffi::PlatformStream<cudaStream_t>>()
       .Arg<F32BufferR2>()
       .Attr<int64_t>("token")
       .Ret<ffi::Buffer<ffi::F32, 2>>();
@@ -853,6 +894,9 @@ auto SolveGraphBinding() {
 
 XLA_FFI_DEFINE_HANDLER(JaxCudssSetupSolver, JaxCudssSetupSolverImpl,
                        SetupSolverBinding());
+
+XLA_FFI_DEFINE_HANDLER(JaxCudssFactorizeGraph, JaxCudssFactorizeGraphImpl,
+                       FactorizeGraphBinding());
 
 XLA_FFI_DEFINE_HANDLER(JaxCudssSolveGraph, JaxCudssSolveGraphImpl,
                        SolveGraphBinding());
@@ -875,6 +919,8 @@ PyObject* Registrations(PyObject*, PyObject*) {
 
   if (!add_capsule("jax_cudss_setup_solver",
                    reinterpret_cast<void*>(JaxCudssSetupSolver)) ||
+      !add_capsule("jax_cudss_factorize_graph",
+                   reinterpret_cast<void*>(JaxCudssFactorizeGraph)) ||
       !add_capsule("jax_cudss_solve_graph",
                    reinterpret_cast<void*>(JaxCudssSolveGraph))) {
     Py_DECREF(dict);

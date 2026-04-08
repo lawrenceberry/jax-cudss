@@ -104,20 +104,22 @@ class PreparedSolverHandle:
 
 
 _SETUP_TARGET_NAME = "jax_cudss_setup_solver"
+_FACTORIZE_TARGET_NAME = "jax_cudss_factorize_graph"
 _SOLVE_TARGET_NAME = "jax_cudss_solve_graph"
-_SOLVE_TARGET_TRAITS = xla_client.CustomCallTargetTraits.COMMAND_BUFFER_COMPATIBLE
+_GRAPH_TARGET_TRAITS = xla_client.CustomCallTargetTraits.COMMAND_BUFFER_COMPATIBLE
+_FACTORIZE_CMD_BUFFER_COMPATIBLE: bool | None = None
 _SOLVE_CMD_BUFFER_COMPATIBLE: bool | None = None
 
 
 @functools.lru_cache(maxsize=1)
-def _register_ffi_targets() -> tuple[str, str]:
-    global _SOLVE_CMD_BUFFER_COMPATIBLE
+def _register_ffi_targets() -> tuple[str, str, str]:
+    global _FACTORIZE_CMD_BUFFER_COMPATIBLE, _SOLVE_CMD_BUFFER_COMPATIBLE
     if _EXTENSION is None:
         raise RuntimeError("cuDSS extension is unavailable") from _IMPORT_ERROR
 
     registrations = _EXTENSION.registrations()
     for name, capsule in registrations.items():
-        if name != _SOLVE_TARGET_NAME:
+        if name == _SETUP_TARGET_NAME:
             jax.ffi.register_ffi_target(name, capsule, platform="CUDA", api_version=1)
             continue
         try:
@@ -126,18 +128,31 @@ def _register_ffi_targets() -> tuple[str, str]:
                 capsule,
                 platform="CUDA",
                 api_version=1,
-                traits=_SOLVE_TARGET_TRAITS,
+                traits=_GRAPH_TARGET_TRAITS,
             )
-            _SOLVE_CMD_BUFFER_COMPATIBLE = True
         except jax.errors.JaxRuntimeError as exc:
-            if "does not support custom call traits" not in str(exc):
-                raise
-            jax.ffi.register_ffi_target(name, capsule, platform="CUDA", api_version=1)
-            _SOLVE_CMD_BUFFER_COMPATIBLE = False
-    return _SETUP_TARGET_NAME, _SOLVE_TARGET_NAME
+            if "does not support custom call traits" in str(exc):
+                raise RuntimeError(
+                    "The current JAX CUDA plugin does not support "
+                    "COMMAND_BUFFER_COMPATIBLE custom call traits, so "
+                    "factorize_graph_csr/solve_graph_csr cannot be used."
+                ) from exc
+            raise
+        if name == _FACTORIZE_TARGET_NAME:
+            _FACTORIZE_CMD_BUFFER_COMPATIBLE = True
+        elif name == _SOLVE_TARGET_NAME:
+            _SOLVE_CMD_BUFFER_COMPATIBLE = True
+    return _SETUP_TARGET_NAME, _FACTORIZE_TARGET_NAME, _SOLVE_TARGET_NAME
+
+
+def factorize_graph_is_cmd_buffer_compatible() -> bool:
+    _validate_backend()
+    _register_ffi_targets()
+    return bool(_FACTORIZE_CMD_BUFFER_COMPATIBLE)
 
 
 def solve_graph_is_cmd_buffer_compatible() -> bool:
+    _validate_backend()
     _register_ffi_targets()
     return bool(_SOLVE_CMD_BUFFER_COMPATIBLE)
 
@@ -190,19 +205,15 @@ def _prepare_rhs(values: jax.Array, b: jax.Array) -> jax.Array:
     return b
 
 
-def _validate_solve_inputs(
-    handle: PreparedSolverHandle, values: jax.Array, rhs: jax.Array
+def _validate_factorize_inputs(
+    handle: PreparedSolverHandle, values: jax.Array
 ) -> tuple[int, int]:
     if not isinstance(handle, PreparedSolverHandle):
         raise TypeError("handle must be a PreparedSolverHandle")
     if values.ndim != 2:
         raise ValueError(f"values must be rank-2 [batch, nnz], got shape {values.shape}")
-    if rhs.ndim != 2:
-        raise ValueError(f"rhs must be rank-2 [batch, n], got shape {rhs.shape}")
     if values.dtype != jnp.float32:
         raise ValueError(f"values must have dtype float32, got {values.dtype}")
-    if rhs.dtype != jnp.float32:
-        raise ValueError(f"rhs must have dtype float32, got {rhs.dtype}")
     if values.shape[0] != handle.batch_size:
         raise ValueError(
             f"values batch dimension must equal prepared batch_size={handle.batch_size}, "
@@ -213,6 +224,18 @@ def _validate_solve_inputs(
             f"values second dimension must equal prepared nnz={handle.nnz}, "
             f"got {values.shape[1]}"
         )
+    return handle.batch_size, handle.nnz
+
+
+def _validate_solve_inputs(
+    handle: PreparedSolverHandle, rhs: jax.Array
+) -> tuple[int, int]:
+    if not isinstance(handle, PreparedSolverHandle):
+        raise TypeError("handle must be a PreparedSolverHandle")
+    if rhs.ndim != 2:
+        raise ValueError(f"rhs must be rank-2 [batch, n], got shape {rhs.shape}")
+    if rhs.dtype != jnp.float32:
+        raise ValueError(f"rhs must have dtype float32, got {rhs.dtype}")
     if rhs.shape[0] != handle.batch_size or rhs.shape[1] != handle.n:
         raise ValueError(
             f"rhs must have shape [{handle.batch_size}, {handle.n}], got {rhs.shape}"
@@ -241,7 +264,7 @@ def setup_solver_csr(
     n, nnz = _validate_csr_structure(indptr, indices)
     structure_hash = _structure_hash(indptr, indices)
 
-    setup_target, _ = _register_ffi_targets()
+    setup_target, _, _ = _register_ffi_targets()
     result_spec = jax.ShapeDtypeStruct((), jnp.int64)
     ffi = jax.ffi.ffi_call(setup_target, result_spec, has_side_effect=True)
     token_array = ffi(
@@ -261,9 +284,28 @@ def setup_solver_csr(
     )
 
 
-def solve_graph_csr(
+def factorize_graph_csr(
     handle: PreparedSolverHandle,
     values: jax.Array | Any,
+) -> None:
+    if _EXTENSION is None:
+        raise RuntimeError(
+            "cuDSS extension is unavailable. Install the optional CUDA dependency "
+            "and build the extension first."
+        ) from _IMPORT_ERROR
+
+    _validate_backend()
+    values = jnp.asarray(values, dtype=jnp.float32)
+    _validate_factorize_inputs(handle, values)
+
+    _, factorize_target, _ = _register_ffi_targets()
+    ffi = jax.ffi.ffi_call(factorize_target, [], has_side_effect=True)
+    ffi(values, token=handle.token)
+    return None
+
+
+def solve_graph_csr(
+    handle: PreparedSolverHandle,
     b: jax.Array | Any,
 ) -> jax.Array:
     if _EXTENSION is None:
@@ -273,11 +315,13 @@ def solve_graph_csr(
         ) from _IMPORT_ERROR
 
     _validate_backend()
-    values = jnp.asarray(values, dtype=jnp.float32)
-    rhs = _prepare_rhs(values, b)
-    batch, n = _validate_solve_inputs(handle, values, rhs)
+    rhs = _prepare_rhs(
+        jnp.empty((handle.batch_size, handle.nnz), dtype=jnp.float32),
+        b,
+    )
+    batch, n = _validate_solve_inputs(handle, rhs)
 
-    _, solve_target = _register_ffi_targets()
+    _, _, solve_target = _register_ffi_targets()
     result_spec = jax.ShapeDtypeStruct((batch, n), jnp.float32)
     ffi = jax.ffi.ffi_call(solve_target, result_spec, has_side_effect=True)
-    return ffi(values, rhs, token=handle.token)
+    return ffi(rhs, token=handle.token)

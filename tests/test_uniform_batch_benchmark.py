@@ -161,8 +161,18 @@ def compiled_solvers(scenario: Scenario) -> dict[str, object]:
     handle = jax_cudss.setup_solver_csr(
         problem["indptr"], problem["indices"], batch_size=scenario.batch_size
     )
-    solve_cudss = jax.jit(
-        lambda vals, rhs: jax_cudss.solve_graph_csr(handle, vals, rhs)
+    factorize_cudss = jax.jit(
+        lambda vals: (
+            jax_cudss.factorize_graph_csr(handle, vals),
+            jnp.int8(0),
+        )[1]
+    )
+    solve_cudss = jax.jit(lambda rhs: jax_cudss.solve_graph_csr(handle, rhs))
+    solve_end_to_end_cudss = jax.jit(
+        lambda vals, rhs: (
+            jax_cudss.factorize_graph_csr(handle, vals),
+            jax_cudss.solve_graph_csr(handle, rhs),
+        )[1]
     )
     solve_lu = jax.jit(
         lambda dense, rhs: jax.vmap(
@@ -171,7 +181,7 @@ def compiled_solvers(scenario: Scenario) -> dict[str, object]:
     )
 
     try:
-        cudss_warm = solve_cudss(problem["values"], problem["rhs_single"])
+        cudss_warm = solve_end_to_end_cudss(problem["values"], problem["rhs_single"])
         jax.block_until_ready(cudss_warm)
     except jax.errors.JaxRuntimeError as exc:
         if "CUDSS_STATUS_ALLOC_FAILED" in str(exc):
@@ -184,7 +194,13 @@ def compiled_solvers(scenario: Scenario) -> dict[str, object]:
     lu_warm = solve_lu(problem["dense_batch"], problem["rhs_batch"])
     jax.block_until_ready(lu_warm)
 
-    return {"handle": handle, "cudss": solve_cudss, "lu": solve_lu}
+    return {
+        "handle": handle,
+        "cudss_factorize": factorize_cudss,
+        "cudss_solve": solve_cudss,
+        "cudss_end_to_end": solve_end_to_end_cudss,
+        "lu": solve_lu,
+    }
 
 
 def _assert_small_residual(
@@ -236,11 +252,11 @@ def test_cudss_setup_profile_reports_analysis_and_reuse(
     assert second.token == first.token
 
 
-def test_solve_graph_is_command_buffer_compatible() -> None:
+def test_graph_calls_are_command_buffer_compatible() -> None:
     _require_gpu()
     _require_cudss()
-    if not jax_cudss.solve_graph_is_cmd_buffer_compatible():
-        pytest.skip("Current JAX CUDA plugin does not support custom call traits.")
+    assert jax_cudss.factorize_graph_is_cmd_buffer_compatible() is True
+    assert jax_cudss.solve_graph_is_cmd_buffer_compatible() is True
 
 
 def test_cudss_lru_eviction_only_affects_unowned_handles(
@@ -274,7 +290,7 @@ def test_cudss_lru_eviction_only_affects_unowned_handles(
     assert handle_c.token != token_a
 
 
-def test_cudss_solve_graph_validates_batch_and_nnz() -> None:
+def test_cudss_factorize_graph_validates_batch_and_nnz() -> None:
     _require_gpu()
     _require_cudss()
     problem = benchmark_problem(Scenario("validation", 2, 8, (-1, 0, 1)))
@@ -283,10 +299,37 @@ def test_cudss_solve_graph_validates_batch_and_nnz() -> None:
     )
 
     with pytest.raises(ValueError, match="prepared nnz"):
-        jax_cudss.solve_graph_csr(handle, problem["values"][:, :-1], problem["rhs_single"])
+        jax_cudss.factorize_graph_csr(handle, problem["values"][:, :-1])
+
+    with pytest.raises(ValueError, match="prepared batch_size"):
+        jax_cudss.factorize_graph_csr(handle, problem["values"][:1])
+
+
+def test_cudss_solve_graph_validates_rhs_shape() -> None:
+    _require_gpu()
+    _require_cudss()
+    problem = benchmark_problem(Scenario("solve_validation", 2, 8, (-1, 0, 1)))
+    handle = jax_cudss.setup_solver_csr(
+        problem["indptr"], problem["indices"], batch_size=2
+    )
 
     with pytest.raises(ValueError, match="rhs must have shape"):
-        jax_cudss.solve_graph_csr(handle, problem["values"], problem["rhs_batch"][:1])
+        jax_cudss.solve_graph_csr(handle, problem["rhs_batch"][:1])
+
+
+def test_cudss_solve_requires_factorization() -> None:
+    _require_gpu()
+    _require_cudss()
+    problem = benchmark_problem(Scenario("solve_requires_factorization", 2, 8, (-1, 0, 1)))
+    handle = jax_cudss.setup_solver_csr(
+        problem["indptr"], problem["indices"], batch_size=2
+    )
+    solve = jax.jit(lambda rhs: jax_cudss.solve_graph_csr(handle, rhs))
+
+    with pytest.raises(
+        jax.errors.JaxRuntimeError, match="call factorize_graph_csr first"
+    ):
+        jax.block_until_ready(solve(problem["rhs_single"]))
 
 
 def test_cudss_rebuilds_when_sparsity_changes() -> None:
@@ -304,6 +347,58 @@ def test_cudss_rebuilds_when_sparsity_changes() -> None:
 
     assert handle_left.structure_hash != handle_right.structure_hash
     assert handle_left.token != handle_right.token
+
+
+def test_cudss_repeated_solve_reuses_factorization() -> None:
+    _require_gpu()
+    _require_cudss()
+    problem = benchmark_problem(Scenario("repeated_solve", 2, 8, (-1, 0, 1)))
+    rhs_alt = problem["rhs_single"] * 0.5
+    handle = jax_cudss.setup_solver_csr(
+        problem["indptr"], problem["indices"], batch_size=2
+    )
+    factorize = jax.jit(
+        lambda vals: (
+            jax_cudss.factorize_graph_csr(handle, vals),
+            jnp.int8(0),
+        )[1]
+    )
+    solve = jax.jit(lambda rhs: jax_cudss.solve_graph_csr(handle, rhs))
+
+    jax.block_until_ready(factorize(problem["values"]))
+    result_first = jax.block_until_ready(solve(problem["rhs_single"]))
+    result_second = jax.block_until_ready(solve(rhs_alt))
+
+    _assert_small_residual(problem["dense_batch"], problem["rhs_batch"], result_first)
+    rhs_alt_batch = jnp.broadcast_to(rhs_alt, problem["rhs_batch"].shape)
+    _assert_small_residual(problem["dense_batch"], rhs_alt_batch, result_second)
+
+
+def test_cudss_repeated_factorization_overwrites_prior_factors() -> None:
+    _require_gpu()
+    _require_cudss()
+    problem = benchmark_problem(Scenario("refactorize", 2, 8, (-1, 0, 1)))
+    handle = jax_cudss.setup_solver_csr(
+        problem["indptr"], problem["indices"], batch_size=2
+    )
+    factorize = jax.jit(
+        lambda vals: (
+            jax_cudss.factorize_graph_csr(handle, vals),
+            jnp.int8(0),
+        )[1]
+    )
+    solve = jax.jit(lambda rhs: jax_cudss.solve_graph_csr(handle, rhs))
+
+    first_values = problem["values"]
+    second_values = problem["values"] * jnp.float32(1.5)
+    dense_second = problem["dense_batch"] * jnp.float32(1.5)
+
+    jax.block_until_ready(factorize(first_values))
+    _ = jax.block_until_ready(solve(problem["rhs_single"]))
+    jax.block_until_ready(factorize(second_values))
+    result = jax.block_until_ready(solve(problem["rhs_single"]))
+
+    _assert_small_residual(dense_second, problem["rhs_batch"], result)
 
 
 @pytest.mark.parametrize("matrix_size", TIMING_DIMENSIONS)
@@ -334,6 +429,42 @@ def test_cudss_analysis_timing_by_dimension(
 
 @pytest.mark.parametrize("matrix_size", TIMING_DIMENSIONS)
 @pytest.mark.parametrize("batch_size", TIMING_BATCHES)
+def test_cudss_prepared_factorize_timing_grid(
+    monkeypatch: pytest.MonkeyPatch, matrix_size: int, batch_size: int
+) -> None:
+    _require_gpu()
+    _require_cudss()
+    monkeypatch.setenv("JAX_CUDSS_MAX_PREPARED_SOLVERS", "1")
+    if matrix_size == 1_000 and batch_size == 1_000:
+        pytest.skip(
+            "Prepared cuDSS solve timing for n=1000, batch=1000 exceeds the "
+            "memory budget on this GPU."
+        )
+
+    problem = sparse_problem(batch_size, matrix_size, (-1, 0, 1))
+    handle = jax_cudss.setup_solver_csr(
+        problem["indptr"], problem["indices"], batch_size=batch_size
+    )
+    factorize = jax.jit(
+        lambda values: (
+            jax_cudss.factorize_graph_csr(handle, values),
+            jnp.int8(0),
+        )[1]
+    )
+    _ = jax.block_until_ready(factorize(problem["values"]))
+    timing_ms = _time_call(factorize, problem["values"]) * 1e3
+    print(
+        f"\ncuDSS prepared factorize timing (ms): n={matrix_size}, "
+        f"batch={batch_size}, factorize={timing_ms:.3f}"
+    )
+
+    del factorize
+    del handle
+    gc.collect()
+
+
+@pytest.mark.parametrize("matrix_size", TIMING_DIMENSIONS)
+@pytest.mark.parametrize("batch_size", TIMING_BATCHES)
 def test_cudss_prepared_solve_timing_grid(
     monkeypatch: pytest.MonkeyPatch, matrix_size: int, batch_size: int
 ) -> None:
@@ -350,17 +481,25 @@ def test_cudss_prepared_solve_timing_grid(
     handle = jax_cudss.setup_solver_csr(
         problem["indptr"], problem["indices"], batch_size=batch_size
     )
-    solve = jax.jit(lambda values, rhs: jax_cudss.solve_graph_csr(handle, values, rhs))
-    result = jax.block_until_ready(solve(problem["values"], problem["rhs_single"]))
+    factorize = jax.jit(
+        lambda values: (
+            jax_cudss.factorize_graph_csr(handle, values),
+            jnp.int8(0),
+        )[1]
+    )
+    solve = jax.jit(lambda rhs: jax_cudss.solve_graph_csr(handle, rhs))
+    jax.block_until_ready(factorize(problem["values"]))
+    result = jax.block_until_ready(solve(problem["rhs_single"]))
     _assert_small_sparse_residual(problem, result)
-    timing_ms = _time_call(solve, problem["values"], problem["rhs_single"]) * 1e3
+    timing_ms = _time_call(solve, problem["rhs_single"]) * 1e3
     print(
         f"\ncuDSS prepared solve timing (ms): n={matrix_size}, "
-        f"batch={batch_size}, factorize_and_solve={timing_ms:.3f}"
+        f"batch={batch_size}, solve={timing_ms:.3f}"
     )
 
     del result
     del solve
+    del factorize
     del handle
     gc.collect()
 
@@ -381,9 +520,16 @@ def test_cudss_scaling_smoke() -> None:
         handle = jax_cudss.setup_solver_csr(
             problem["indptr"], problem["indices"], batch_size=batch_size
         )
-        solve = jax.jit(lambda values, rhs: jax_cudss.solve_graph_csr(handle, values, rhs))
+        end_to_end = jax.jit(
+            lambda values, rhs: (
+                jax_cudss.factorize_graph_csr(handle, values),
+                jax_cudss.solve_graph_csr(handle, rhs),
+            )[1]
+        )
         try:
-            result = jax.block_until_ready(solve(problem["values"], problem["rhs_single"]))
+            result = jax.block_until_ready(
+                end_to_end(problem["values"], problem["rhs_single"])
+            )
         except jax.errors.JaxRuntimeError as exc:
             if "CUDSS_STATUS_ALLOC_FAILED" in str(exc):
                 pytest.skip(
@@ -393,10 +539,13 @@ def test_cudss_scaling_smoke() -> None:
             raise
         _assert_small_residual(problem["dense_batch"], problem["rhs_batch"], result)
         timings_ms.append(
-            (batch_size, _time_call(solve, problem["values"], problem["rhs_single"]) * 1e3)
+            (
+                batch_size,
+                _time_call(end_to_end, problem["values"], problem["rhs_single"]) * 1e3,
+            )
         )
         del result
-        del solve
+        del end_to_end
         del handle
         gc.collect()
 
@@ -414,12 +563,15 @@ def test_cudss_prepared_handle_smoke() -> None:
     values = jnp.array([[2.0, 3.0], [4.0, 5.0]], dtype=jnp.float32)
     rhs = jnp.array([8.0, 15.0], dtype=jnp.float32)
     handle = jax_cudss.setup_solver_csr(indptr, indices, batch_size=2)
-    solve = jax.jit(
-        lambda solver_handle, vals, vec: jax_cudss.solve_graph_csr(
-            solver_handle, vals, vec
-        )
+    factorize = jax.jit(
+        lambda solver_handle, vals: (
+            jax_cudss.factorize_graph_csr(solver_handle, vals),
+            jnp.int8(0),
+        )[1]
     )
-    result = jax.block_until_ready(solve(handle, values, rhs))
+    solve = jax.jit(lambda solver_handle, vec: jax_cudss.solve_graph_csr(solver_handle, vec))
+    jax.block_until_ready(factorize(handle, values))
+    result = jax.block_until_ready(solve(handle, rhs))
     np.testing.assert_allclose(
         np.asarray(result),
         np.asarray([[4.0, 5.0], [2.0, 3.0]], dtype=np.float32),
@@ -445,7 +597,7 @@ def test_cudss_uniform_batch_benchmark(
 
     def run() -> jax.Array:
         return jax.block_until_ready(
-            solvers["cudss"](problem["values"], problem["rhs_single"])
+            solvers["cudss_end_to_end"](problem["values"], problem["rhs_single"])
         )
 
     result = benchmark.pedantic(run, rounds=1, warmup_rounds=1, iterations=1)
@@ -474,7 +626,7 @@ def test_jax_lu_uniform_batch_benchmark(
     result = benchmark.pedantic(run, rounds=1, warmup_rounds=1, iterations=1)
     _assert_small_residual(problem["dense_batch"], problem["rhs_batch"], result)
 
-    cudss_result = solvers["cudss"](problem["values"], problem["rhs_single"])
+    cudss_result = solvers["cudss_end_to_end"](problem["values"], problem["rhs_single"])
     cudss_result = jax.block_until_ready(cudss_result)
     np.testing.assert_allclose(
         np.asarray(cudss_result),
@@ -483,7 +635,9 @@ def test_jax_lu_uniform_batch_benchmark(
         atol=5e-3,
     )
 
-    cudss_time = _time_call(solvers["cudss"], problem["values"], problem["rhs_single"])
+    cudss_time = _time_call(
+        solvers["cudss_end_to_end"], problem["values"], problem["rhs_single"]
+    )
     lu_time = _time_call(solvers["lu"], problem["dense_batch"], problem["rhs_batch"])
     ratio = lu_time / cudss_time
     print(
