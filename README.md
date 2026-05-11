@@ -227,6 +227,53 @@ handle = jax_cudss.setup_solver_csr(indptr, indices, batch_size=2)
 profile = jax_cudss.cudss_last_profile()
 ```
 
+## CUDA Graph and command-buffer execution
+
+The steady-state cuDSS calls are intended to be usable from XLA CUDA command
+buffers, which are XLA's CUDA Graph execution path.
+
+The package currently separates setup from factorization and solve:
+
+- `setup_solver_csr` performs cuDSS analysis, creates or reuses a prepared
+  solver, returns a Python `PreparedSolverHandle`, and synchronizes with the
+  host to materialize the native solver token. This setup path is not
+  command-buffer compatible and is expected to run outside the repeated
+  low-overhead solve path.
+- `factorize_graph_csr` and `solve_graph_csr` are registered as
+  `COMMAND_BUFFER_COMPATIBLE` JAX FFI custom calls. These are the calls intended
+  to be embedded in XLA CUDA command buffers when used inside `jax.jit`.
+
+Command-buffer-compatible registration is necessary but not sufficient. XLA
+must also be configured to enable command buffers before JAX initializes:
+
+```bash
+export XLA_FLAGS="--xla_gpu_enable_command_buffer=all"
+```
+
+or for a single command:
+
+```bash
+XLA_FLAGS="--xla_gpu_enable_command_buffer=all" \
+uv run python -m pytest tests/test_uniform_batch_benchmark.py::test_graph_calls_are_command_buffer_compatible
+```
+
+Set `XLA_FLAGS` before importing `jax`. Changing it after JAX has initialized
+the backend may have no effect.
+
+The test `test_graph_calls_are_command_buffer_compatible` checks that JAX
+accepts the command-buffer-compatible custom call registration for
+`factorize_graph_csr` and `solve_graph_csr`. It does not prove that a particular
+compiled executable was captured as a CUDA Graph. For that, use a profiler such
+as Nsight Systems on a jitted factorize/solve workload and check for command
+buffer or CUDA Graph launches rather than repeated host-driven launches.
+
+In short:
+
+- Setup is outside the CUDA Graph path.
+- Factorize and solve are marked command-buffer compatible.
+- Actual CUDA Graph execution depends on a supporting JAX CUDA plugin and
+  `XLA_FLAGS="--xla_gpu_enable_command_buffer=all"` being set before JAX starts.
+
 ## Limitations
 
 - GPU backend only.
