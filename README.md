@@ -131,6 +131,39 @@ Solves using the most recent factorization attached to `handle`.
 
 `factorize_graph_csr` must be called successfully before `solve_graph_csr`.
 
+## Caching behavior
+
+The package caches cuDSS sparsity analysis, and it retains the latest
+factorization attached to each prepared solver.
+
+`setup_solver_csr` caches prepared solver objects keyed by:
+
+- GPU device ordinal
+- cuDSS reordering and threading configuration
+- CSR structure hash
+- matrix size
+- nonzero count
+- batch size
+
+Calling `setup_solver_csr` again with the same sparsity pattern and compatible
+configuration reuses the existing prepared solver token and avoids repeating
+cuDSS analysis.
+
+`factorize_graph_csr` stores the latest numeric factorization in the prepared
+solver. Repeated `solve_graph_csr` calls on the same handle reuse that
+factorization, which is useful when solving multiple right-hand sides for the
+same matrix values.
+
+Calling `factorize_graph_csr` again overwrites the previous factorization. The
+package does not currently keep a cache of multiple numeric factorizations keyed
+by matrix values.
+
+In short:
+
+- Sparsity analysis is cached and reused.
+- The latest factorization for a prepared solver is retained and reused.
+- Multiple previous factorizations are not cached.
+
 ## Structure
 
 ### `jax_cudss/__init__.py`
