@@ -38,20 +38,42 @@ except Exception as exc:  # pragma: no cover - exercised indirectly in tests
 
 
 def cudss_import_error() -> Exception | None:
+    """Return the exception raised while importing the native cuDSS extension.
+
+    Returns ``None`` when the optional ``jax_cudss._cudss`` extension imported
+    successfully. If the extension is unavailable, returns the original import
+    exception so callers can report or inspect why GPU cuDSS support is missing.
+    """
     return _IMPORT_ERROR
 
 
 def has_cudss_binding() -> bool:
+    """Return whether the native cuDSS extension is available.
+
+    This is a lightweight availability check for the optional
+    ``jax_cudss._cudss`` extension. It does not validate that the active JAX
+    backend is GPU-capable.
+    """
     return _EXTENSION is not None
 
 
 def cudss_last_profile() -> dict[str, Any] | None:
+    """Return profiling data recorded by the most recent cuDSS setup call.
+
+    Returns ``None`` when the native extension is unavailable. Profiling is
+    controlled by the native extension and is primarily useful for inspecting
+    setup, analysis, allocation, and cache behavior.
+    """
     if _EXTENSION is None:
         return None
     return _EXTENSION.last_profile()
 
 
 def clear_cudss_last_profile() -> None:
+    """Clear the native extension's most recent cuDSS profiling record.
+
+    This is a no-op when the optional native extension is unavailable.
+    """
     if _EXTENSION is not None:
         _EXTENSION.clear_last_profile()
 
@@ -63,6 +85,14 @@ def _release_prepared_solver(token: int) -> None:
 
 @jax.tree_util.register_pytree_node_class
 class PreparedSolverHandle:
+    """Opaque handle for a prepared cuDSS CSR solver.
+
+    Instances are returned by :func:`setup_solver_csr` and passed to
+    :func:`factorize_graph_csr` and :func:`solve_graph_csr`. The handle stores
+    metadata about the prepared CSR structure and owns a native prepared solver
+    token while the Python object is alive.
+    """
+
     def __init__(
         self,
         *,
@@ -145,12 +175,24 @@ def _register_ffi_targets() -> tuple[str, str, str]:
 
 
 def factorize_graph_is_cmd_buffer_compatible() -> bool:
+    """Return whether the factorize FFI handler is command-buffer compatible.
+
+    Registers the FFI targets if needed and reports whether
+    ``factorize_graph_csr`` is exposed with command-buffer-compatible XLA FFI
+    handler metadata. Requires a JAX GPU backend and the native cuDSS extension.
+    """
     _validate_backend()
     _register_ffi_targets()
     return bool(_FACTORIZE_CMD_BUFFER_COMPATIBLE)
 
 
 def solve_graph_is_cmd_buffer_compatible() -> bool:
+    """Return whether the solve FFI handler is command-buffer compatible.
+
+    Registers the FFI targets if needed and reports whether
+    ``solve_graph_csr`` is exposed with command-buffer-compatible XLA FFI
+    handler metadata. Requires a JAX GPU backend and the native cuDSS extension.
+    """
     _validate_backend()
     _register_ffi_targets()
     return bool(_SOLVE_CMD_BUFFER_COMPATIBLE)
@@ -248,6 +290,19 @@ def setup_solver_csr(
     *,
     batch_size: int,
 ) -> PreparedSolverHandle:
+    """Prepare or reuse a cuDSS solver for a batched CSR sparsity structure.
+
+    ``indptr`` and ``indices`` describe a square CSR matrix structure and are
+    converted to rank-1 ``int32`` JAX arrays. ``batch_size`` is the number of
+    matrices that will share this sparsity pattern. The native extension hashes
+    the structure and creates or reuses a cached cuDSS analysis object for the
+    active GPU device.
+
+    This setup path performs host synchronization to materialize the native
+    solver token and is expected to run outside repeated CUDA Graph /
+    command-buffer execution. Use the returned handle with
+    :func:`factorize_graph_csr` and :func:`solve_graph_csr`.
+    """
     if _EXTENSION is None:
         raise RuntimeError(
             "cuDSS extension is unavailable. Install the optional CUDA dependency "
@@ -287,6 +342,18 @@ def factorize_graph_csr(
     handle: PreparedSolverHandle,
     values: jax.Array | Any,
 ) -> None:
+    """Factorize batched CSR matrix values for a prepared solver.
+
+    ``handle`` must be a :class:`PreparedSolverHandle` returned by
+    :func:`setup_solver_csr`. ``values`` is converted to ``float32`` and must
+    have shape ``[handle.batch_size, handle.nnz]``. Each row contains the
+    numeric nonzero values for one matrix in the batch, using the CSR structure
+    captured by ``handle``.
+
+    The call updates native cuDSS factorization state and returns no JAX value.
+    It is intended to be used inside ``jax.jit`` as a side-effecting FFI custom
+    call, and its native handler is marked command-buffer compatible.
+    """
     if _EXTENSION is None:
         raise RuntimeError(
             "cuDSS extension is unavailable. Install the optional CUDA dependency "
@@ -307,6 +374,18 @@ def solve_graph_csr(
     handle: PreparedSolverHandle,
     b: jax.Array | Any,
 ) -> jax.Array:
+    """Solve batched CSR systems using the latest factorization for a handle.
+
+    ``handle`` must be a :class:`PreparedSolverHandle` that has already been
+    factorized with :func:`factorize_graph_csr`. ``b`` is converted to
+    ``float32`` and may have shape ``[handle.n]`` or
+    ``[handle.batch_size, handle.n]``. A rank-1 right-hand side is broadcast
+    across the batch.
+
+    Returns a ``float32`` JAX array with shape
+    ``[handle.batch_size, handle.n]``. The native handler is marked
+    command-buffer compatible for use in jitted repeated solve paths.
+    """
     if _EXTENSION is None:
         raise RuntimeError(
             "cuDSS extension is unavailable. Install the optional CUDA dependency "
