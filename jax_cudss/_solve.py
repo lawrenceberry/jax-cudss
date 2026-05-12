@@ -11,7 +11,6 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxlib import xla_client
 
 _IMPORT_ERROR: Exception | None = None
 _EXTENSION: Any | None = None
@@ -125,7 +124,6 @@ class PreparedSolverHandle:
 _SETUP_TARGET_NAME = "jax_cudss_setup_solver"
 _FACTORIZE_TARGET_NAME = "jax_cudss_factorize_graph"
 _SOLVE_TARGET_NAME = "jax_cudss_solve_graph"
-_GRAPH_TARGET_TRAITS = xla_client.CustomCallTargetTraits.COMMAND_BUFFER_COMPATIBLE
 _FACTORIZE_CMD_BUFFER_COMPATIBLE: bool | None = None
 _SOLVE_CMD_BUFFER_COMPATIBLE: bool | None = None
 
@@ -138,32 +136,11 @@ def _register_ffi_targets() -> tuple[str, str, str]:
 
     registrations = _EXTENSION.registrations()
     for name, capsule in registrations.items():
-        if name == _SETUP_TARGET_NAME:
-            jax.ffi.register_ffi_target(name, capsule, platform="CUDA", api_version=1)
-            continue
-        cmd_buffer_compatible = True
-        try:
-            jax.ffi.register_ffi_target(
-                name,
-                capsule,
-                platform="CUDA",
-                api_version=1,
-                traits=_GRAPH_TARGET_TRAITS,
-            )
-        except jax.errors.JaxRuntimeError as exc:
-            if "does not support custom call traits" not in str(exc):
-                raise
-            cmd_buffer_compatible = False
-            jax.ffi.register_ffi_target(
-                name,
-                capsule,
-                platform="CUDA",
-                api_version=1,
-            )
+        jax.ffi.register_ffi_target(name, capsule, platform="CUDA", api_version=1)
         if name == _FACTORIZE_TARGET_NAME:
-            _FACTORIZE_CMD_BUFFER_COMPATIBLE = cmd_buffer_compatible
+            _FACTORIZE_CMD_BUFFER_COMPATIBLE = True
         elif name == _SOLVE_TARGET_NAME:
-            _SOLVE_CMD_BUFFER_COMPATIBLE = cmd_buffer_compatible
+            _SOLVE_CMD_BUFFER_COMPATIBLE = True
     return _SETUP_TARGET_NAME, _FACTORIZE_TARGET_NAME, _SOLVE_TARGET_NAME
 
 

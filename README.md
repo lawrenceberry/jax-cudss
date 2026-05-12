@@ -272,43 +272,58 @@ The package currently separates setup from factorization and solve:
   host to materialize the native solver token. This setup path is not
   command-buffer compatible and is expected to run outside the repeated
   low-overhead solve path.
-- `factorize_graph_csr` and `solve_graph_csr` attempt to register as
-  `COMMAND_BUFFER_COMPATIBLE` JAX FFI custom calls. These are the calls intended
-  to be embedded in XLA CUDA command buffers when used inside `jax.jit`.
-  If the installed JAX CUDA plugin rejects custom-call traits, they fall back to
-  ordinary CUDA FFI registration so sparse solves still work.
+- `factorize_graph_csr` and `solve_graph_csr` are the calls intended to be
+  embedded in XLA CUDA command buffers when used inside `jax.jit`.
 
-Command-buffer-compatible registration is necessary but not sufficient. XLA
-must also be configured to enable command buffers before JAX initializes. Older
-JAX/XLA builds used:
+The command-buffer compatibility trait is compiled into the native XLA FFI
+handler metadata with `ffi::Traits::kCmdBufferCompatible` for the factorize and
+solve handlers. The Python wrapper registers the FFI targets normally with
+`jax.ffi.register_ffi_target`; it does not pass Python-level custom-call traits.
+This matters because the JAX CUDA 13 plugin used with JAX `0.10.0` rejects
+Python registration-time custom-call traits, even though XLA FFI handler traits
+are accepted.
+
+Command-buffer-compatible handler metadata is necessary but not sufficient. XLA
+must also be configured to enable command buffers before JAX initializes. With
+the CUDA 13 / JAX `0.10.0` stack used by this package, enable custom-call command
+buffers with:
 
 ```bash
-export XLA_FLAGS="--xla_gpu_enable_command_buffer=all"
+export XLA_FLAGS="--xla_gpu_enable_command_buffer=custom_call"
 ```
 
 or for a single command:
 
 ```bash
-XLA_FLAGS="--xla_gpu_enable_command_buffer=all" \
+XLA_FLAGS="--xla_gpu_enable_command_buffer=custom_call" \
 uv run python -m pytest tests/test_uniform_batch_benchmark.py::test_graph_calls_are_command_buffer_compatible
 ```
 
 Set `XLA_FLAGS` before importing `jax`. Changing it after JAX has initialized
-the backend may have no effect. Check the accepted values for the installed JAX
-version: JAX `0.10.0` rejects the older `all` value in this environment.
+the backend may have no effect. JAX `0.10.0` rejects the older
+`--xla_gpu_enable_command_buffer=all` value in this environment.
+
+A typical graph-enabled workflow is:
+
+```bash
+XLA_FLAGS="--xla_gpu_enable_command_buffer=custom_call" uv run python script.py
+```
+
+where `script.py` imports JAX only after the environment variable is set, calls
+`setup_solver_csr` once outside the repeated solve loop, and then calls jitted
+`factorize_graph_csr` / `solve_graph_csr` functions inside the repeated path.
 
 The test `test_graph_calls_are_command_buffer_compatible` checks that JAX
-accepts the command-buffer-compatible custom call registration for
-`factorize_graph_csr` and `solve_graph_csr`. It does not prove that a particular
-compiled executable was captured as a CUDA Graph. For that, use a profiler such
-as Nsight Systems on a jitted factorize/solve workload and check for command
-buffer or CUDA Graph launches rather than repeated host-driven launches.
+sees the factorize and solve handlers as command-buffer compatible. It does not
+prove that a particular compiled executable was captured as a CUDA Graph. For
+that, use a profiler such as Nsight Systems on a jitted factorize/solve workload
+and check for command buffer or CUDA Graph launches rather than repeated
+host-driven launches.
 
 In short:
 
 - Setup is outside the CUDA Graph path.
-- Factorize and solve request command-buffer-compatible registration when the
-  installed JAX CUDA plugin supports it.
+- Factorize and solve carry command-buffer-compatible XLA FFI handler metadata.
 - Actual CUDA Graph execution depends on a supporting JAX CUDA plugin and
   a command-buffer `XLA_FLAGS` setting accepted by the installed JAX/XLA build.
 

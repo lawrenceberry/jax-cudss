@@ -896,10 +896,14 @@ XLA_FFI_DEFINE_HANDLER(JaxCudssSetupSolver, JaxCudssSetupSolverImpl,
                        SetupSolverBinding());
 
 XLA_FFI_DEFINE_HANDLER(JaxCudssFactorizeGraph, JaxCudssFactorizeGraphImpl,
-                       FactorizeGraphBinding());
+                       FactorizeGraphBinding(),
+                       (std::initializer_list<ffi::Traits>{
+                           ffi::Traits::kCmdBufferCompatible}));
 
 XLA_FFI_DEFINE_HANDLER(JaxCudssSolveGraph, JaxCudssSolveGraphImpl,
-                       SolveGraphBinding());
+                       SolveGraphBinding(),
+                       (std::initializer_list<ffi::Traits>{
+                           ffi::Traits::kCmdBufferCompatible}));
 
 PyObject* Registrations(PyObject*, PyObject*) {
   PyObject* dict = PyDict_New();
