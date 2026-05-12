@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import ctypes
+import importlib.metadata as md
 import weakref
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -13,7 +16,23 @@ from jaxlib import xla_client
 _IMPORT_ERROR: Exception | None = None
 _EXTENSION: Any | None = None
 
+
+def _preload_cuda_libraries() -> None:
+    try:
+        cudss_dist = md.distribution("nvidia-cudss-cu13")
+    except md.PackageNotFoundError:
+        return
+
+    lib_dir = Path(cudss_dist.locate_file("nvidia/cu13/lib"))
+    mode = getattr(ctypes, "RTLD_GLOBAL", 0)
+    for library in ("libcudart.so.13", "libcudss.so.0"):
+        path = lib_dir / library
+        if path.exists():
+            ctypes.CDLL(str(path), mode=mode)
+
+
 try:
+    _preload_cuda_libraries()
     from . import _cudss as _EXTENSION
 except Exception as exc:  # pragma: no cover - exercised indirectly in tests
     _IMPORT_ERROR = exc
@@ -122,6 +141,7 @@ def _register_ffi_targets() -> tuple[str, str, str]:
         if name == _SETUP_TARGET_NAME:
             jax.ffi.register_ffi_target(name, capsule, platform="CUDA", api_version=1)
             continue
+        cmd_buffer_compatible = True
         try:
             jax.ffi.register_ffi_target(
                 name,
@@ -131,17 +151,19 @@ def _register_ffi_targets() -> tuple[str, str, str]:
                 traits=_GRAPH_TARGET_TRAITS,
             )
         except jax.errors.JaxRuntimeError as exc:
-            if "does not support custom call traits" in str(exc):
-                raise RuntimeError(
-                    "The current JAX CUDA plugin does not support "
-                    "COMMAND_BUFFER_COMPATIBLE custom call traits, so "
-                    "factorize_graph_csr/solve_graph_csr cannot be used."
-                ) from exc
-            raise
+            if "does not support custom call traits" not in str(exc):
+                raise
+            cmd_buffer_compatible = False
+            jax.ffi.register_ffi_target(
+                name,
+                capsule,
+                platform="CUDA",
+                api_version=1,
+            )
         if name == _FACTORIZE_TARGET_NAME:
-            _FACTORIZE_CMD_BUFFER_COMPATIBLE = True
+            _FACTORIZE_CMD_BUFFER_COMPATIBLE = cmd_buffer_compatible
         elif name == _SOLVE_TARGET_NAME:
-            _SOLVE_CMD_BUFFER_COMPATIBLE = True
+            _SOLVE_CMD_BUFFER_COMPATIBLE = cmd_buffer_compatible
     return _SETUP_TARGET_NAME, _FACTORIZE_TARGET_NAME, _SOLVE_TARGET_NAME
 
 

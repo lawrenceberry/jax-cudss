@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import gc
+import subprocess
 import time
 from functools import lru_cache
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -31,9 +32,49 @@ SCALING_BATCHES = (1, 10, 100, 1_000)
 TIMING_DIMENSIONS = (10, 100, 1_000)
 TIMING_BATCHES = (10, 100, 1_000)
 RESIDUAL_RTOL = 5e-4
+MIN_FREE_GPU_MEMORY_MIB = 4_096
+_INITIAL_FREE_GPU_MEMORY_MIB: int | None = None
+_CHECKED_INITIAL_FREE_GPU_MEMORY = False
+
+
+def _free_gpu_memory_mib() -> int | None:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    free_values: list[int] = []
+    for line in result.stdout.splitlines():
+        try:
+            free_values.append(int(line.strip()))
+        except ValueError:
+            continue
+    return max(free_values, default=None)
 
 
 def _require_gpu() -> None:
+    global _CHECKED_INITIAL_FREE_GPU_MEMORY, _INITIAL_FREE_GPU_MEMORY_MIB
+    if not _CHECKED_INITIAL_FREE_GPU_MEMORY:
+        _INITIAL_FREE_GPU_MEMORY_MIB = _free_gpu_memory_mib()
+        _CHECKED_INITIAL_FREE_GPU_MEMORY = True
+    if (
+        _INITIAL_FREE_GPU_MEMORY_MIB is not None
+        and _INITIAL_FREE_GPU_MEMORY_MIB < MIN_FREE_GPU_MEMORY_MIB
+    ):
+        pytest.skip(
+            f"These benchmarks require at least {MIN_FREE_GPU_MEMORY_MIB} MiB "
+            "of initially free GPU memory; only "
+            f"{_INITIAL_FREE_GPU_MEMORY_MIB} MiB was free."
+        )
     if jax.default_backend() != "gpu":
         pytest.skip("These benchmarks require the JAX GPU backend.")
 
@@ -41,6 +82,20 @@ def _require_gpu() -> None:
 def _require_cudss() -> None:
     if not jax_cudss.has_cudss_binding():
         pytest.skip(f"cuDSS binding unavailable: {jax_cudss.cudss_import_error()!r}")
+
+
+def _setup_solver_csr(*args: Any, **kwargs: Any) -> jax_cudss.PreparedSolverHandle:
+    try:
+        return jax_cudss.setup_solver_csr(*args, **kwargs)
+    except jax.errors.JaxRuntimeError as exc:
+        message = str(exc)
+        if (
+            "out of memory" in message
+            or "cudaErrorMemoryAllocation" in message
+            or "CUDSS_STATUS_ALLOC_FAILED" in message
+        ):
+            pytest.skip(f"cuDSS setup exhausted device memory: {exc}")
+        raise
 
 
 def _pattern(
@@ -158,7 +213,7 @@ def _time_call(fn, *args, repeats: int = 3) -> float:
 
 def compiled_solvers(scenario: Scenario) -> dict[str, object]:
     problem = benchmark_problem(scenario)
-    handle = jax_cudss.setup_solver_csr(
+    handle = _setup_solver_csr(
         problem["indptr"], problem["indices"], batch_size=scenario.batch_size
     )
     factorize_cudss = jax.jit(
@@ -233,7 +288,7 @@ def test_cudss_setup_profile_reports_analysis_and_reuse(
     indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
     indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
 
-    first = jax_cudss.setup_solver_csr(indptr, indices, batch_size=2)
+    first = _setup_solver_csr(indptr, indices, batch_size=2)
     first_profile = jax_cudss.cudss_last_profile()
     assert first_profile is not None
     assert first_profile["cache_hit"] is False
@@ -244,7 +299,7 @@ def test_cudss_setup_profile_reports_analysis_and_reuse(
     assert first_profile["n"] == 3
     assert first_profile["nnz"] == 4
 
-    second = jax_cudss.setup_solver_csr(indptr, indices, batch_size=2)
+    second = _setup_solver_csr(indptr, indices, batch_size=2)
     second_profile = jax_cudss.cudss_last_profile()
     assert second_profile is not None
     assert second_profile["cache_hit"] is True
@@ -255,8 +310,14 @@ def test_cudss_setup_profile_reports_analysis_and_reuse(
 def test_graph_calls_are_command_buffer_compatible() -> None:
     _require_gpu()
     _require_cudss()
-    assert jax_cudss.factorize_graph_is_cmd_buffer_compatible() is True
-    assert jax_cudss.solve_graph_is_cmd_buffer_compatible() is True
+    if not (
+        jax_cudss.factorize_graph_is_cmd_buffer_compatible()
+        and jax_cudss.solve_graph_is_cmd_buffer_compatible()
+    ):
+        pytest.skip(
+            "The current JAX CUDA plugin does not support command-buffer "
+            "custom-call traits."
+        )
 
 
 def test_cudss_lru_eviction_only_affects_unowned_handles(
@@ -269,13 +330,13 @@ def test_cudss_lru_eviction_only_affects_unowned_handles(
     base = benchmark_problem(Scenario("base", 2, 8, (-1, 0, 1)))
     alt = benchmark_problem(Scenario("alt", 2, 8, (-2, -1, 0, 1)))
 
-    handle_a = jax_cudss.setup_solver_csr(base["indptr"], base["indices"], batch_size=2)
+    handle_a = _setup_solver_csr(base["indptr"], base["indices"], batch_size=2)
     token_a = handle_a.token
 
-    handle_b = jax_cudss.setup_solver_csr(alt["indptr"], alt["indices"], batch_size=2)
+    handle_b = _setup_solver_csr(alt["indptr"], alt["indices"], batch_size=2)
     assert handle_b.token != token_a
 
-    handle_a_again = jax_cudss.setup_solver_csr(
+    handle_a_again = _setup_solver_csr(
         base["indptr"], base["indices"], batch_size=2
     )
     assert handle_a_again.token == token_a
@@ -284,7 +345,7 @@ def test_cudss_lru_eviction_only_affects_unowned_handles(
     del handle_a_again
     gc.collect()
 
-    handle_c = jax_cudss.setup_solver_csr(
+    handle_c = _setup_solver_csr(
         base["indptr"], base["indices"], batch_size=2
     )
     assert handle_c.token != token_a
@@ -294,7 +355,7 @@ def test_cudss_factorize_graph_validates_batch_and_nnz() -> None:
     _require_gpu()
     _require_cudss()
     problem = benchmark_problem(Scenario("validation", 2, 8, (-1, 0, 1)))
-    handle = jax_cudss.setup_solver_csr(
+    handle = _setup_solver_csr(
         problem["indptr"], problem["indices"], batch_size=2
     )
 
@@ -309,7 +370,7 @@ def test_cudss_solve_graph_validates_rhs_shape() -> None:
     _require_gpu()
     _require_cudss()
     problem = benchmark_problem(Scenario("solve_validation", 2, 8, (-1, 0, 1)))
-    handle = jax_cudss.setup_solver_csr(
+    handle = _setup_solver_csr(
         problem["indptr"], problem["indices"], batch_size=2
     )
 
@@ -321,7 +382,7 @@ def test_cudss_solve_requires_factorization() -> None:
     _require_gpu()
     _require_cudss()
     problem = benchmark_problem(Scenario("solve_requires_factorization", 2, 8, (-1, 0, 1)))
-    handle = jax_cudss.setup_solver_csr(
+    handle = _setup_solver_csr(
         problem["indptr"], problem["indices"], batch_size=2
     )
     solve = jax.jit(lambda rhs: jax_cudss.solve_graph_csr(handle, rhs))
@@ -338,10 +399,10 @@ def test_cudss_rebuilds_when_sparsity_changes() -> None:
     left = benchmark_problem(Scenario("left", 2, 8, (-1, 0, 1)))
     right = benchmark_problem(Scenario("right", 2, 8, (-2, -1, 0, 1)))
 
-    handle_left = jax_cudss.setup_solver_csr(
+    handle_left = _setup_solver_csr(
         left["indptr"], left["indices"], batch_size=2
     )
-    handle_right = jax_cudss.setup_solver_csr(
+    handle_right = _setup_solver_csr(
         right["indptr"], right["indices"], batch_size=2
     )
 
@@ -354,7 +415,7 @@ def test_cudss_repeated_solve_reuses_factorization() -> None:
     _require_cudss()
     problem = benchmark_problem(Scenario("repeated_solve", 2, 8, (-1, 0, 1)))
     rhs_alt = problem["rhs_single"] * 0.5
-    handle = jax_cudss.setup_solver_csr(
+    handle = _setup_solver_csr(
         problem["indptr"], problem["indices"], batch_size=2
     )
     factorize = jax.jit(
@@ -378,7 +439,7 @@ def test_cudss_repeated_factorization_overwrites_prior_factors() -> None:
     _require_gpu()
     _require_cudss()
     problem = benchmark_problem(Scenario("refactorize", 2, 8, (-1, 0, 1)))
-    handle = jax_cudss.setup_solver_csr(
+    handle = _setup_solver_csr(
         problem["indptr"], problem["indices"], batch_size=2
     )
     factorize = jax.jit(
@@ -412,7 +473,7 @@ def test_cudss_analysis_timing_by_dimension(
 
     problem = sparse_problem(100, matrix_size, (-1, 0, 1))
     jax_cudss.clear_cudss_last_profile()
-    handle = jax_cudss.setup_solver_csr(
+    handle = _setup_solver_csr(
         problem["indptr"], problem["indices"], batch_size=100
     )
     profile = jax_cudss.cudss_last_profile()
@@ -442,7 +503,7 @@ def test_cudss_prepared_factorize_timing_grid(
         )
 
     problem = sparse_problem(batch_size, matrix_size, (-1, 0, 1))
-    handle = jax_cudss.setup_solver_csr(
+    handle = _setup_solver_csr(
         problem["indptr"], problem["indices"], batch_size=batch_size
     )
     factorize = jax.jit(
@@ -478,7 +539,7 @@ def test_cudss_prepared_solve_timing_grid(
         )
 
     problem = sparse_problem(batch_size, matrix_size, (-1, 0, 1))
-    handle = jax_cudss.setup_solver_csr(
+    handle = _setup_solver_csr(
         problem["indptr"], problem["indices"], batch_size=batch_size
     )
     factorize = jax.jit(
@@ -517,7 +578,7 @@ def test_cudss_scaling_smoke() -> None:
             SMALL_DENSE_FAVORABLE.offsets,
         )
         problem = benchmark_problem(scenario)
-        handle = jax_cudss.setup_solver_csr(
+        handle = _setup_solver_csr(
             problem["indptr"], problem["indices"], batch_size=batch_size
         )
         end_to_end = jax.jit(
@@ -562,7 +623,7 @@ def test_cudss_prepared_handle_smoke() -> None:
     indices = jnp.array([0, 1], dtype=jnp.int32)
     values = jnp.array([[2.0, 3.0], [4.0, 5.0]], dtype=jnp.float32)
     rhs = jnp.array([8.0, 15.0], dtype=jnp.float32)
-    handle = jax_cudss.setup_solver_csr(indptr, indices, batch_size=2)
+    handle = _setup_solver_csr(indptr, indices, batch_size=2)
     factorize = jax.jit(
         lambda solver_handle, vals: (
             jax_cudss.factorize_graph_csr(solver_handle, vals),

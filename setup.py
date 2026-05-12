@@ -42,8 +42,8 @@ def _discover_cudss() -> tuple[list[str], list[str]]:
         include_dirs.append(str(Path(cudss_root) / "include"))
         lib_dirs.append(str(Path(cudss_root) / "lib"))
     else:
-        include = _dist_path("nvidia-cudss-cu12", "nvidia/cu12/include")
-        lib = _dist_path("nvidia-cudss-cu12", "nvidia/cu12/lib")
+        include = _dist_path("nvidia-cudss-cu13", "nvidia/cu13/include")
+        lib = _dist_path("nvidia-cudss-cu13", "nvidia/cu13/lib")
         if include and lib:
             include_dirs.append(str(include))
             lib_dirs.append(str(lib))
@@ -53,13 +53,13 @@ def _discover_cudss() -> tuple[list[str], list[str]]:
     if cuda_runtime_include:
         include_dirs.append(cuda_runtime_include)
     else:
-        include = _dist_path("nvidia-cuda-runtime-cu12", "nvidia/cuda_runtime/include")
+        include = _dist_path("nvidia-cuda-runtime", "nvidia/cu13/include")
         if include:
             include_dirs.append(str(include))
     if cuda_runtime_lib:
         lib_dirs.append(cuda_runtime_lib)
     else:
-        lib = _dist_path("nvidia-cuda-runtime-cu12", "nvidia/cuda_runtime/lib")
+        lib = _dist_path("nvidia-cuda-runtime", "nvidia/cu13/lib")
         if lib:
             lib_dirs.append(str(lib))
 
@@ -77,7 +77,7 @@ def _discover_cudss_shared_object(lib_dirs: list[str]) -> str | None:
 
 def _discover_cuda_runtime_shared_object(lib_dirs: list[str]) -> str | None:
     for lib_dir in lib_dirs:
-        for candidate in ("libcudart.so", "libcudart.so.12"):
+        for candidate in ("libcudart.so", "libcudart.so.13", "libcudart.so.12"):
             path = Path(lib_dir) / candidate
             if path.exists():
                 return str(path)
@@ -94,11 +94,26 @@ def _discover_jax_include() -> str | None:
 
 
 class OptionalBuildExt(build_ext):
-    def build_extension(self, ext: Extension) -> None:
+    def _extension_build_inputs(
+        self,
+    ) -> tuple[list[str], list[str], str | None, str | None, str | None]:
         include_dirs, lib_dirs = _discover_cudss()
-        cudss_shared_object = _discover_cudss_shared_object(lib_dirs)
-        cudart_shared_object = _discover_cuda_runtime_shared_object(lib_dirs)
-        jax_include = _discover_jax_include()
+        return (
+            include_dirs,
+            lib_dirs,
+            _discover_cudss_shared_object(lib_dirs),
+            _discover_cuda_runtime_shared_object(lib_dirs),
+            _discover_jax_include(),
+        )
+
+    def run(self) -> None:
+        (
+            include_dirs,
+            lib_dirs,
+            cudss_shared_object,
+            cudart_shared_object,
+            jax_include,
+        ) = self._extension_build_inputs()
         if (
             not include_dirs
             or not lib_dirs
@@ -113,16 +128,21 @@ class OptionalBuildExt(build_ext):
                 "CUDA_RUNTIME_LIBRARY_DIR as needed.",
                 stacklevel=2,
             )
+            self.extensions = []
             return
 
-        ext.include_dirs = _dedupe([*ext.include_dirs, *include_dirs, jax_include])
-        ext.library_dirs = _dedupe([*ext.library_dirs, *lib_dirs])
-        ext.libraries = []
-        ext.extra_objects = [cudss_shared_object, cudart_shared_object]
-        if os.name != "nt":
-            ext.runtime_library_dirs = _dedupe(
-                [*(ext.runtime_library_dirs or []), *lib_dirs]
-            )
+        for ext in self.extensions:
+            ext.include_dirs = _dedupe([*ext.include_dirs, *include_dirs, jax_include])
+            ext.library_dirs = _dedupe([*ext.library_dirs, *lib_dirs])
+            ext.libraries = []
+            ext.extra_objects = [cudss_shared_object, cudart_shared_object]
+            if os.name != "nt":
+                ext.runtime_library_dirs = _dedupe(
+                    [*(ext.runtime_library_dirs or []), *lib_dirs]
+                )
+        super().run()
+
+    def build_extension(self, ext: Extension) -> None:
         super().build_extension(ext)
 
 
